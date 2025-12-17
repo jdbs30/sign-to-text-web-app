@@ -13,16 +13,13 @@ declare global {
   }
 }
 
-const SMOOTH_WINDOW = 5
-const REQUIRED_STABLE_FRAMES = 15
-const STABLE_THRESHOLD = 0.4
-const NEXT_HOLD_MS = 1200
+const LETTER_HOLD_MS = 2000
+const NEXT_HOLD_MS = 2000
 
 export default function Page() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-
-  /* ================= UI STATE ================= */
+	const nextTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const [currentLetter, setCurrentLetter] = useState('—')
   const [pendingWord, setPendingWord] = useState('')
   const [committedSentence, setCommittedSentence] = useState('')
@@ -30,53 +27,11 @@ export default function Page() {
   const [debugEnabled, setDebugEnabled] = useState(false)
   const [flipped, setFlipped] = useState(false)
 
-  /* ================= REFS (LOGIC ONLY) ================= */
-  const lastLandmarksRef = useRef<Point[] | null>(null)
-  const stableFramesRef = useRef(0)
-  const smoothQueueRef = useRef<string[]>([])
-
-  const lockedLetterRef = useRef<string>('')     // ✅ REAL letter storage
-  const wordRef = useRef<string>('')             // ✅ REAL word storage
-  const nextLockRef = useRef(false)
-  const nextTimerRef = useRef<NodeJS.Timeout | null>(null)
-
-  /* ================= HELPERS ================= */
-
-  const smoothPrediction = (pred: string) => {
-    if (pred === '—' || pred.toLowerCase() === 'next') return pred
-    smoothQueueRef.current.push(pred)
-    if (smoothQueueRef.current.length > SMOOTH_WINDOW)
-      smoothQueueRef.current.shift()
-
-    const freq: Record<string, number> = {}
-    for (const p of smoothQueueRef.current) freq[p] = (freq[p] || 0) + 1
-    return Object.entries(freq).sort((a, b) => b[1] - a[1])[0][0]
-  }
-
-  const isHandStable = (lm: Point[]) => {
-    if (!lastLandmarksRef.current) {
-      lastLandmarksRef.current = lm
-      stableFramesRef.current = 0
-      return false
-    }
-
-    let movement = 0
-    for (let i = 0; i < lm.length; i++) {
-      const dx = lm[i]?.x - lastLandmarksRef.current[i]?.x
-      const dy = lm[i]?.y - lastLandmarksRef.current[i]?.y
-      movement += Math.sqrt(dx * dx + dy * dy)
-    }
-
-    movement /= lm.length
-    lastLandmarksRef.current = lm
-
-    if (movement < STABLE_THRESHOLD) stableFramesRef.current++
-    else stableFramesRef.current = 0
-
-    return stableFramesRef.current >= REQUIRED_STABLE_FRAMES
-  }
-
-  /* ================= MAIN EFFECT ================= */
+  // Hold refs
+  const letterHoldStartRef = useRef<number | null>(null)
+  const nextHoldStartRef = useRef<number | null>(null)
+  const lockedLetterRef = useRef<string>('')
+  const pendingWordRef = useRef<string>('')
 
   useEffect(() => {
     let hands: any
@@ -86,10 +41,9 @@ export default function Page() {
         'https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js',
         'https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js',
       ]
-
       for (const src of scripts) {
         if (!document.querySelector(`script[src="${src}"]`)) {
-          await new Promise<void>(res => {
+          await new Promise<void>((res) => {
             const s = document.createElement('script')
             s.src = src
             s.onload = () => res()
@@ -98,14 +52,14 @@ export default function Page() {
         }
       }
 
-      const video = videoRef.current!
-      const canvas = canvasRef.current!
+      const video = videoRef.current
+      const canvas = canvasRef.current
+      if (!video || !canvas) return
       const ctx = canvas.getContext('2d')!
 
       const stream = await navigator.mediaDevices.getUserMedia({ video: true })
       video.srcObject = stream
       await video.play()
-
       canvas.width = video.videoWidth
       canvas.height = video.videoHeight
 
@@ -132,10 +86,11 @@ export default function Page() {
 
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
 
+        // No hand detected
         if (!results.multiHandLandmarks?.length) {
-          stableFramesRef.current = 0
+          letterHoldStartRef.current = null
+          nextHoldStartRef.current = null
           lockedLetterRef.current = ''
-          nextLockRef.current = false
           ctx.restore()
           return
         }
@@ -146,53 +101,54 @@ export default function Page() {
 
         const result = detectChar(lm, debugEnabled)
         if (debugEnabled && result.debug) setDebugInfo(result.debug)
+        setCurrentLetter(result.letter)
 
-        const stable = isHandStable(lm)
-        const rawChar = result.letter
+        const now = performance.now()
 
-        /* ===== NEXT ===== */
-        if (rawChar.toLowerCase() === 'next' && stable) {
-          setCurrentLetter('Next')
-
-          if (!nextLockRef.current) {
-            nextLockRef.current = true
-
-            if (lockedLetterRef.current) {
-              wordRef.current += lockedLetterRef.current
-              setPendingWord(wordRef.current)
-              lockedLetterRef.current = ''
-            }
-
-            if (nextTimerRef.current) clearTimeout(nextTimerRef.current)
-            nextTimerRef.current = setTimeout(() => {
-              if (wordRef.current.trim()) {
-                setCommittedSentence(s =>
-                  s ? `${s} ${wordRef.current}` : wordRef.current
-                )
-              }
-              wordRef.current = ''
-              setPendingWord('')
-              nextLockRef.current = false
-            }, NEXT_HOLD_MS)
+        // ===== LETTER HOLD =====
+        if (result.letter !== '—' && result.letter.toLowerCase() !== 'next') {
+          if (lockedLetterRef.current !== result.letter) {
+            letterHoldStartRef.current = letterHoldStartRef.current || now
           }
 
-          ctx.restore()
-          return
-        }
-
-        /* ===== LETTER ===== */
-        if (rawChar !== '—' && stable) {
-          const smoothed = smoothPrediction(rawChar)
-          lockedLetterRef.current = smoothed
-          setCurrentLetter(smoothed)
-          nextLockRef.current = false
-
-          if (nextTimerRef.current) {
-            clearTimeout(nextTimerRef.current)
-            nextTimerRef.current = null
+          if (
+            letterHoldStartRef.current &&
+            now - letterHoldStartRef.current >= LETTER_HOLD_MS &&
+            lockedLetterRef.current !== result.letter
+          ) {
+            lockedLetterRef.current = result.letter
+            pendingWordRef.current += lockedLetterRef.current
+            setPendingWord(pendingWordRef.current)
+            letterHoldStartRef.current = null
           }
+        } else {
+          letterHoldStartRef.current = null
+          lockedLetterRef.current = ''
         }
 
+        
+
+				// Inside onResults:
+				if (result.letter.toLowerCase() === 'next') {
+					if (!nextTimeoutRef.current && pendingWordRef.current.trim()) {
+						// Start timeout to commit after NEXT_HOLD_MS
+						nextTimeoutRef.current = setTimeout(() => {
+							setCommittedSentence((s) =>
+								s ? `${s} ${pendingWordRef.current}` : pendingWordRef.current
+							)
+							pendingWordRef.current = ''
+							setPendingWord('')
+							lockedLetterRef.current = ''
+							nextTimeoutRef.current = null
+						}, NEXT_HOLD_MS)
+					}
+				} else {
+					// Hand moved away, cancel the timeout
+					if (nextTimeoutRef.current) {
+						clearTimeout(nextTimeoutRef.current)
+						nextTimeoutRef.current = null
+					}
+				}
         ctx.restore()
       })
 
@@ -208,11 +164,36 @@ export default function Page() {
     init()
 
     return () => {
-      if (nextTimerRef.current) clearTimeout(nextTimerRef.current)
+      if (videoRef.current?.srcObject) {
+        const tracks = (videoRef.current.srcObject as MediaStream).getTracks()
+        tracks.forEach((t) => t.stop())
+      }
     }
   }, [flipped, debugEnabled])
 
-  /* ================= UI ================= */
+  // ===== PROGRESS BARS =====
+  const [letterProgress, setLetterProgress] = useState(0)
+  const [nextProgress, setNextProgress] = useState(0)
+
+  useEffect(() => {
+    let anim: number
+    const updateProgress = () => {
+      const now = performance.now()
+      setLetterProgress(
+        letterHoldStartRef.current
+          ? Math.min(((now - letterHoldStartRef.current) / LETTER_HOLD_MS) * 100, 100)
+          : 0
+      )
+      setNextProgress(
+        nextHoldStartRef.current
+          ? Math.min(((now - nextHoldStartRef.current) / NEXT_HOLD_MS) * 100, 100)
+          : 0
+      )
+      anim = requestAnimationFrame(updateProgress)
+    }
+    anim = requestAnimationFrame(updateProgress)
+    return () => cancelAnimationFrame(anim)
+  }, [])
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-purple-700 to-indigo-600 flex flex-col items-center p-4 text-white">
@@ -226,29 +207,98 @@ export default function Page() {
       </div>
 
       <div className="mt-4 flex gap-2">
-        <button
-          onClick={() => setFlipped(f => !f)}
-          className="px-4 py-2 bg-white text-black rounded"
-        >
+        <button onClick={() => setFlipped((f) => !f)} className="btn">
           Flip
         </button>
         <button
-          onClick={() => setDebugEnabled(d => !d)}
-          className="px-4 py-2 bg-white text-black rounded"
+          onClick={() => {
+            setCommittedSentence((prev) =>
+              prev ? `${prev} ${pendingWordRef.current}` : pendingWordRef.current
+            )
+            pendingWordRef.current = ''
+            setPendingWord('')
+          }}
+          className="btn"
         >
+          Commit Word
+        </button>
+        <button
+          onClick={() => {
+            setCommittedSentence('')
+            pendingWordRef.current = ''
+            setPendingWord('')
+            setCurrentLetter('—')
+            lockedLetterRef.current = ''
+            letterHoldStartRef.current = null
+            nextHoldStartRef.current = null
+          }}
+          className="btn"
+        >
+          Clear
+        </button>
+        <button onClick={() => setDebugEnabled((d) => !d)} className="btn">
           {debugEnabled ? 'Hide Debug' : 'Show Debug'}
         </button>
       </div>
 
-      <p className="mt-4 bg-white text-black p-2 rounded w-[640px]">
+      <p className="mt-4 bg-white text-black p-2 rounded w-[640px] min-h-[50px]">
         <b>Sentence:</b> {committedSentence}
       </p>
 
-      <p className="mt-2 bg-white text-black p-2 rounded w-[640px]">
+      <p className="mt-2 bg-white text-black p-2 rounded w-[640px] min-h-[40px]">
         <b>Pending Word:</b> {pendingWord}
       </p>
 
+      {/* Hold Progress Bars */}
+      <div className="mt-4 w-[640px] space-y-2">
+        <div>
+          <b>Letter Hold Progress:</b>
+          <div className="h-4 bg-white/30 rounded">
+            <div
+              className="h-4 bg-green-500 rounded"
+              style={{ width: `${letterProgress}%` }}
+            />
+          </div>
+        </div>
+
+        <div>
+          <b>Next Hold Progress:</b>
+          <div className="h-4 bg-white/30 rounded">
+            <div
+              className="h-4 bg-blue-500 rounded"
+              style={{ width: `${nextProgress}%` }}
+            />
+          </div>
+        </div>
+      </div>
+
       <video ref={videoRef} hidden />
+
+      {debugEnabled && debugInfo && (
+        <div className="absolute top-2 left-2 bg-black/80 text-white text-xs p-3 rounded w-[350px] space-y-1">
+          <div>
+            <b>Raw Best:</b> {debugInfo.rawBest}
+          </div>
+          <div>
+            <b>Raw Score:</b> {debugInfo.rawScore}
+          </div>
+          <div>
+            <b>Final:</b> {debugInfo.heuristicOutput}
+          </div>
+          <div>
+            <b>Fired Rules:</b> {debugInfo.firedRules.join(', ')}</div>
+          <div>
+            <b>Top Distances:</b>{' '}
+            {debugInfo.topDistances.map((d) => `${d.letter}:${d.score}`).join(', ')}
+          </div>
+          {debugInfo.pointDistances && (
+            <div>
+              <b>Point Distances:</b>{' '}
+              {debugInfo.pointDistances.map((d) => `${d.label}:${d.value}`).join(', ')}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
