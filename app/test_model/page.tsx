@@ -19,20 +19,20 @@ const NEXT_HOLD_MS = 2000
 export default function Page() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-	const nextTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const nextTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   const [currentLetter, setCurrentLetter] = useState('—')
   const [pendingWord, setPendingWord] = useState('')
   const [committedSentence, setCommittedSentence] = useState('')
   const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null)
   const [debugEnabled, setDebugEnabled] = useState(false)
   const [flipped, setFlipped] = useState(false)
-
+	
   // Hold refs
   const letterHoldStartRef = useRef<number | null>(null)
   const nextHoldStartRef = useRef<number | null>(null)
   const lockedLetterRef = useRef<string>('')
   const pendingWordRef = useRef<string>('')
-
+	const nextLockedRef = useRef(false)
   useEffect(() => {
     let hands: any
 
@@ -88,9 +88,15 @@ export default function Page() {
 
         // No hand detected
         if (!results.multiHandLandmarks?.length) {
+          // Reset hold start times when no hand detected
           letterHoldStartRef.current = null
           nextHoldStartRef.current = null
           lockedLetterRef.current = ''
+          // Cancel pending next timeout if any
+          if (nextTimeoutRef.current) {
+            clearTimeout(nextTimeoutRef.current)
+            nextTimeoutRef.current = null
+          }
           ctx.restore()
           return
         }
@@ -105,50 +111,67 @@ export default function Page() {
 
         const now = performance.now()
 
-        // ===== LETTER HOLD =====
+        // ===== LETTER HOLD LOGIC =====
         if (result.letter !== '—' && result.letter.toLowerCase() !== 'next') {
           if (lockedLetterRef.current !== result.letter) {
-            letterHoldStartRef.current = letterHoldStartRef.current || now
+            // Start hold timer if a new letter
+            if (!letterHoldStartRef.current) {
+              letterHoldStartRef.current = now
+            }
           }
-
+          // Check if hold duration met
           if (
             letterHoldStartRef.current &&
             now - letterHoldStartRef.current >= LETTER_HOLD_MS &&
             lockedLetterRef.current !== result.letter
           ) {
+            // Commit the letter
             lockedLetterRef.current = result.letter
             pendingWordRef.current += lockedLetterRef.current
             setPendingWord(pendingWordRef.current)
+            // Reset hold start
             letterHoldStartRef.current = null
           }
         } else {
+          // No letter or 'next' gesture detected, reset hold timer
           letterHoldStartRef.current = null
           lockedLetterRef.current = ''
         }
 
-        
-
-				// Inside onResults:
+				// ===== NEXT HOLD LOGIC (TIMEOUT-BASED, FIXED) =====
 				if (result.letter.toLowerCase() === 'next') {
 					if (!nextTimeoutRef.current && pendingWordRef.current.trim()) {
-						// Start timeout to commit after NEXT_HOLD_MS
+						// ✅ CAPTURE the word NOW
+						const wordToCommit = pendingWordRef.current
+
+						nextHoldStartRef.current = performance.now()
+
 						nextTimeoutRef.current = setTimeout(() => {
 							setCommittedSentence((s) =>
-								s ? `${s} ${pendingWordRef.current}` : pendingWordRef.current
+								s ? `${s} ${wordToCommit}` : wordToCommit
 							)
+
+							// Clear AFTER commit
 							pendingWordRef.current = ''
 							setPendingWord('')
 							lockedLetterRef.current = ''
+
 							nextTimeoutRef.current = null
+							nextHoldStartRef.current = null
 						}, NEXT_HOLD_MS)
 					}
 				} else {
-					// Hand moved away, cancel the timeout
+					// Hand moved away → cancel everything
 					if (nextTimeoutRef.current) {
 						clearTimeout(nextTimeoutRef.current)
 						nextTimeoutRef.current = null
 					}
+					nextHoldStartRef.current = null
 				}
+
+
+
+
         ctx.restore()
       })
 
@@ -231,6 +254,10 @@ export default function Page() {
             lockedLetterRef.current = ''
             letterHoldStartRef.current = null
             nextHoldStartRef.current = null
+            if (nextTimeoutRef.current) {
+              clearTimeout(nextTimeoutRef.current)
+              nextTimeoutRef.current = null
+            }
           }}
           className="btn"
         >
@@ -286,7 +313,8 @@ export default function Page() {
             <b>Final:</b> {debugInfo.heuristicOutput}
           </div>
           <div>
-            <b>Fired Rules:</b> {debugInfo.firedRules.join(', ')}</div>
+            <b>Fired Rules:</b> {debugInfo.firedRules.join(', ')}
+          </div>
           <div>
             <b>Top Distances:</b>{' '}
             {debugInfo.topDistances.map((d) => `${d.letter}:${d.score}`).join(', ')}

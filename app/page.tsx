@@ -1,306 +1,367 @@
-'use client';
+'use client'
 
-import React, { useEffect, useRef, useState } from 'react';
-import * as tf from '@tensorflow/tfjs';
+import { useEffect, useRef, useState } from 'react'
+import { detectChar } from '@/utils/detectChar'
+import type { DebugInfo } from '@/utils/detectChar'
+import type { Point } from '@/utils/handTypes'
 
-import { detectChar } from '@/utils/detectChar';
-import type { Point } from '@/utils/handTypes';
-import { LetterProfiler } from '@/utils/letterProfiler';
-import { useDelayedSmoothing } from '@/hooks/useDelayedSmoothing';
-
-/* ============================= 
-   LETTER GROUPS
-============================= */
-const LETTER_GROUPS: Record<string, string[]> = {
-  G1: ['y', 'j'],
-  G2: ['c', 'o'],
-  G3: ['g', 'h'],
-  G4: ['b','d','f','i','u','v','k','r','w'],
-  G5: ['p','q','z'],
-  G6: ['a','e','m','n','s','t'],
-  G7: ['l'],
-  G8: ['x']
-};
-
-function getLetterGroup(letter: string): string | null {
-  letter = letter.toLowerCase();
-  for (const groupId in LETTER_GROUPS) {
-    if (LETTER_GROUPS[groupId].includes(letter)) return groupId;
+declare global {
+  interface Window {
+    Hands: any
+    drawLandmarks: any
+    drawConnectors: any
   }
-  return null;
 }
 
-/* ============================= 
-   HYBRID RESOLVER
-============================= */
-function resolveChar(
-  cnnChar: string,
-  cnnConf: number,
-  heuristic: any,
-  prevChar: string
-) {
-  const hChar = heuristic?.letter ?? '';
+const LETTER_HOLD_MS = 2000
+const NEXT_HOLD_MS = 2000
 
-  if (['next', 'Backspace'].includes(hChar)) return hChar;
-
-  const cnnGroup = getLetterGroup(cnnChar);
-  const hGroup = getLetterGroup(hChar);
-
-  if (cnnGroup && hGroup && cnnGroup === hGroup) return hChar;
-
-  if (cnnChar === hChar && cnnConf > 0.5) return cnnChar;
-  if (cnnConf > 0.75 && cnnChar.length === 1) return cnnChar;
-  if (cnnConf < 0.6 && hChar.length === 1) return hChar;
-
-  return prevChar;
-}
-
-/* ============================= 
-   COMPONENT
-============================= */
-export default function DebugHandTyping() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const tempCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const latestPtsRef = useRef<Point[] | null>(null);
-  const profilerRef = useRef(new LetterProfiler());
-
-  const [model, setModel] = useState<tf.LayersModel | null>(null);
-  const [typedStr, setTypedStr] = useState('');
-  const [currentSymbol, setCurrentSymbol] = useState('');
-  const [currentGroup, setCurrentGroup] = useState<string | null>(null);
-  const [lastRecorded, setLastRecorded] = useState<string | null>(null);
-  const [profilerData, setProfilerData] = useState<any>(null);
-  const [showRecorder, setShowRecorder] = useState(false);
-
-  const stableCharRef = useRef('');
-  const stableCountRef = useRef(0);
-  const committedCharRef = useRef<string | null>(null);
-
-  const { processLandmark } = useDelayedSmoothing(3, 0.8);
-
-  /* ============================= 
-     LOAD CNN MODEL
-  ============================== */
+export default function Page() {
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const nextTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const [currentLetter, setCurrentLetter] = useState('—')
+  const [pendingWord, setPendingWord] = useState('')
+  const [committedSentence, setCommittedSentence] = useState('')
+  const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null)
+  const [debugEnabled, setDebugEnabled] = useState(false)
+  const [flipped, setFlipped] = useState(false)
+	
+  // Hold refs
+  const letterHoldStartRef = useRef<number | null>(null)
+  const nextHoldStartRef = useRef<number | null>(null)
+  const lockedLetterRef = useRef<string>('')
+  const pendingWordRef = useRef<string>('')
+	const nextLockedRef = useRef(false)
   useEffect(() => {
-    tf.ready().then(async () => {
-      const m = await tf.loadLayersModel('/model/model.json');
-      setModel(m);
-    });
-  }, []);
-
-  /* ============================= 
-     INIT MEDIAPIPE & CAMERA
-  ============================== */
-  useEffect(() => {
-    if (!model) return;
-
-    const loadScript = (src: string) =>
-      new Promise<void>((resolve) => {
-        const s = document.createElement('script');
-        s.src = src;
-        s.async = true;
-        s.onload = () => resolve();
-        document.body.appendChild(s);
-      });
+    let hands: any
 
     const init = async () => {
-      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js');
-      await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js');
+      const scripts = [
+        'https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js',
+        'https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js',
+      ]
+      for (const src of scripts) {
+        if (!document.querySelector(`script[src="${src}"]`)) {
+          await new Promise<void>((res) => {
+            const s = document.createElement('script')
+            s.src = src
+            s.onload = () => res()
+            document.body.appendChild(s)
+          })
+        }
+      }
 
-      if (!videoRef.current || !canvasRef.current) return;
+      const video = videoRef.current
+      const canvas = canvasRef.current
+      if (!video || !canvas) return
+      const ctx = canvas.getContext('2d')!
 
-      tempCanvasRef.current = document.createElement('canvas');
-      tempCanvasRef.current.width = 400;
-      tempCanvasRef.current.height = 400;
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true })
+      video.srcObject = stream
+      await video.play()
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
 
-      const hands = new (window as any).Hands({
-        locateFile: (f: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
-      });
+      hands = new window.Hands({
+        locateFile: (f: string) =>
+          `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
+      })
 
       hands.setOptions({
         maxNumHands: 1,
         modelComplexity: 1,
         minDetectionConfidence: 0.7,
-        minTrackingConfidence: 0.6,
-      });
+        minTrackingConfidence: 0.7,
+      })
 
       hands.onResults((results: any) => {
-        if (!results.multiHandLandmarks?.length) return;
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        ctx.save()
 
-        const canvas = canvasRef.current!;
-        const ctx = canvas.getContext('2d')!;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-        // Camera preview
-        ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
-
-        const rawPts: Point[] = results.multiHandLandmarks[0].map((p: any) => ({
-          x: p.x,
-          y: p.y,
-          z: p.z,
-        }));
-
-        const pts = rawPts.map((p, i) => processLandmark(i, p) ?? p);
-        latestPtsRef.current = pts;
-
-        // Draw landmarks
-        ctx.fillStyle = 'lime';
-        pts.forEach((p) => {
-          ctx.beginPath();
-          ctx.arc(p.x * canvas.width, p.y * canvas.height, 5, 0, Math.PI * 2);
-          ctx.fill();
-        });
-
-        const heuristic = detectChar(pts);
-
-        // CNN input
-        const temp = tempCanvasRef.current!;
-        const tctx = temp.getContext('2d')!;
-        tctx.clearRect(0, 0, 400, 400);
-        tctx.drawImage(results.image, 0, 0, 400, 400);
-
-        const { cnnChar, cnnConf } = tf.tidy(() => {
-          const input = tf.browser.fromPixels(temp).toFloat().div(255).expandDims(0);
-          const logits = model.predict(input) as tf.Tensor;
-          const probs = logits.softmax();
-          const data = probs.dataSync();
-          const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-          const idx = data.indexOf(Math.max(...data));
-          return { cnnChar: letters[idx] || '', cnnConf: data[idx] };
-        });
-
-        const resolved = resolveChar(cnnChar, cnnConf, heuristic, stableCharRef.current);
-
-        // Stability & commit
-        if (resolved === stableCharRef.current) {
-          stableCountRef.current++;
-        } else {
-          stableCharRef.current = resolved;
-          stableCountRef.current = 0;
-          committedCharRef.current = null;
+        if (flipped) {
+          ctx.translate(canvas.width, 0)
+          ctx.scale(-1, 1)
         }
 
-        if (stableCountRef.current === 10) {
-          if (committedCharRef.current !== resolved) {
-            if (resolved === 'Backspace') setTypedStr((s) => s.slice(0, -1));
-            else if (resolved === 'next') setTypedStr((s) => s + ' ');
-            else if (resolved.length === 1) setTypedStr((s) => s + resolved);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
 
-            committedCharRef.current = resolved;
+        // No hand detected
+        if (!results.multiHandLandmarks?.length) {
+          // Reset hold start times when no hand detected
+          letterHoldStartRef.current = null
+          nextHoldStartRef.current = null
+          lockedLetterRef.current = ''
+          // Cancel pending next timeout if any
+          if (nextTimeoutRef.current) {
+            clearTimeout(nextTimeoutRef.current)
+            nextTimeoutRef.current = null
           }
-          stableCountRef.current = 0;
+          ctx.restore()
+          return
         }
 
-        setCurrentSymbol(resolved);
-        setCurrentGroup(getLetterGroup(resolved));
-      });
+        const lm: Point[] = results.multiHandLandmarks[0]
+        window.drawConnectors(ctx, lm, window.Hands.HAND_CONNECTIONS)
+        window.drawLandmarks(ctx, lm)
 
-      const camera = new (window as any).Camera(videoRef.current, {
-        onFrame: async () => hands.send({ image: videoRef.current }),
-        width: 640,
-        height: 480,
-      });
-      camera.start();
-    };
+        const result = detectChar(lm, debugEnabled)
+        if (debugEnabled && result.debug) setDebugInfo(result.debug)
+        setCurrentLetter(result.letter)
 
-    init();
-  }, [model, processLandmark]);
+        const now = performance.now()
 
-  /* ============================= 
-     MANUAL RECORDING
-  ============================== */
-  const recordLetter = (letter: string) => {
-    const pts = latestPtsRef.current;
-    if (!pts || pts.length !== 21) {
-      alert('No valid hand landmarks detected.');
-      return;
+        // ===== LETTER HOLD LOGIC =====
+        if (result.letter !== '—' && result.letter.toLowerCase() !== 'next') {
+          if (lockedLetterRef.current !== result.letter) {
+            // Start hold timer if a new letter
+            if (!letterHoldStartRef.current) {
+              letterHoldStartRef.current = now
+            }
+          }
+          // Check if hold duration met
+          if (
+            letterHoldStartRef.current &&
+            now - letterHoldStartRef.current >= LETTER_HOLD_MS &&
+            lockedLetterRef.current !== result.letter
+          ) {
+            // Commit the letter
+            lockedLetterRef.current = result.letter
+            pendingWordRef.current += lockedLetterRef.current
+            setPendingWord(pendingWordRef.current)
+            // Reset hold start
+            letterHoldStartRef.current = null
+          }
+        } else {
+          // No letter or 'next' gesture detected, reset hold timer
+          letterHoldStartRef.current = null
+          lockedLetterRef.current = ''
+        }
+
+				// ===== NEXT HOLD LOGIC (TIMEOUT-BASED, FIXED) =====
+				if (result.letter.toLowerCase() === 'next') {
+					if (!nextTimeoutRef.current && pendingWordRef.current.trim()) {
+						// ✅ CAPTURE the word NOW
+						const wordToCommit = pendingWordRef.current
+
+						nextHoldStartRef.current = performance.now()
+
+						nextTimeoutRef.current = setTimeout(() => {
+							setCommittedSentence((s) =>
+								s ? `${s} ${wordToCommit}` : wordToCommit
+							)
+
+							// Clear AFTER commit
+							pendingWordRef.current = ''
+							setPendingWord('')
+							lockedLetterRef.current = ''
+
+							nextTimeoutRef.current = null
+							nextHoldStartRef.current = null
+						}, NEXT_HOLD_MS)
+					}
+				} else {
+					// Hand moved away → cancel everything
+					if (nextTimeoutRef.current) {
+						clearTimeout(nextTimeoutRef.current)
+						nextTimeoutRef.current = null
+					}
+					nextHoldStartRef.current = null
+				}
+
+
+
+
+        ctx.restore()
+      })
+
+      await hands.initialize()
+
+      const loop = async () => {
+        await hands.send({ image: video })
+        requestAnimationFrame(loop)
+      }
+      loop()
     }
-    profilerRef.current.recordSample(letter, pts);
-    setProfilerData(profilerRef.current.exportData());
-    setLastRecorded(letter);
-  };
 
-  const downloadJSON = () => {
-    if (!profilerData) return;
-    const blob = new Blob([JSON.stringify(profilerData, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'hand_profiler_data.json';
-    a.click();
-  };
+    init()
 
-  /* ============================= 
-     UI
-  ============================== */
-  return (
-    <div className="p-6 max-w-4xl mx-auto space-y-6 font-sans">
-      <h1 className="text-2xl font-bold text-center">Hand Typing Debug</h1>
+    return () => {
+      if (videoRef.current?.srcObject) {
+        const tracks = (videoRef.current.srcObject as MediaStream).getTracks()
+        tracks.forEach((t) => t.stop())
+      }
+    }
+  }, [flipped, debugEnabled])
 
-      <div className="relative">
-        <video ref={videoRef} autoPlay playsInline muted className="hidden" />
+  // ===== PROGRESS BARS =====
+  const [letterProgress, setLetterProgress] = useState(0)
+  const [nextProgress, setNextProgress] = useState(0)
+
+  useEffect(() => {
+    let anim: number
+    const updateProgress = () => {
+      const now = performance.now()
+      setLetterProgress(
+        letterHoldStartRef.current
+          ? Math.min(((now - letterHoldStartRef.current) / LETTER_HOLD_MS) * 100, 100)
+          : 0
+      )
+      setNextProgress(
+        nextHoldStartRef.current
+          ? Math.min(((now - nextHoldStartRef.current) / NEXT_HOLD_MS) * 100, 100)
+          : 0
+      )
+      anim = requestAnimationFrame(updateProgress)
+    }
+    anim = requestAnimationFrame(updateProgress)
+    return () => cancelAnimationFrame(anim)
+  }, [])
+
+ return (
+  <div className="min-h-screen bg-gradient-to-br from-[#0f0c29] via-[#302b63] to-[#24243e] flex items-center justify-center p-6 text-white">
+    <div className="w-full max-w-7xl grid grid-cols-1 lg:grid-cols-[3fr_2fr] gap-6">
+
+      {/* ================= CAMERA ================= */}
+      <div className="relative rounded-3xl overflow-hidden shadow-2xl bg-black/60 ring-1 ring-white/10 flex justify-center items-center">
+        {/* Make canvas larger by setting explicit width/height */}
         <canvas
           ref={canvasRef}
-          width={640}
-          height={480}
-          className="w-full rounded-lg shadow-lg border"
+          width={480} // Larger width
+          height={640} // Larger height
+          className="w-[90%] max-w-[1200px] h-auto"
         />
+
+        {/* CURRENT LETTER */}
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2">
+          <div className="px-16 py-8 rounded-full bg-gradient-to-br from-white to-gray-200 text-black text-7xl font-black tracking-widest shadow-[0_0_40px_rgba(255,255,255,0.4)]">
+            {currentLetter}
+          </div>
+        </div>
       </div>
 
-      <div className="flex justify-between items-center text-lg font-medium">
+      {/* ================= SIDE PANEL ================= */}
+      <div className="flex flex-col gap-6 bg-black/40 backdrop-blur-xl rounded-3xl p-6 shadow-xl ring-1 ring-white/10 max-w-md">
+        {/* TITLE */}
         <div>
-          Typed: <span className="text-blue-600">{typedStr}</span>
+          <h1 className="text-3xl font-bold tracking-wide">
+            🤚 Gesture Translator
+          </h1>
+          <p className="text-sm opacity-60">
+            Hold letter · Hold <b>NEXT</b> to commit word
+          </p>
         </div>
-        <div className="flex items-center gap-3">
-          <span>
-            Current: <span className="text-green-600">{currentSymbol}</span>
-          </span>
-          {currentGroup && (
-            <span className="px-2 py-1 bg-purple-200 text-purple-800 rounded-full text-sm font-semibold">
-              {currentGroup}
-            </span>
-          )}
-        </div>
-      </div>
 
-      {/* Collapsible recorder */}
-      <div className="border rounded p-3 shadow">
-        <button
-          className="w-full text-left font-semibold px-2 py-1 bg-gray-200 rounded hover:bg-gray-300"
-          onClick={() => setShowRecorder(!showRecorder)}
-        >
-          {showRecorder ? 'Hide Manual Recorder' : 'Show Manual Recorder'}
-        </button>
-
-        {showRecorder && (
-          <div className="mt-3 space-y-2">
-            <div className="flex flex-wrap gap-2">
-              {'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map((l) => (
-                <button
-                  key={l}
-                  onClick={() => recordLetter(l)}
-                  className="px-3 py-1 border rounded bg-white hover:bg-gray-100 shadow-sm"
-                >
-                  {l}
-                </button>
-              ))}
+        {/* ================= PROGRESS ================= */}
+        <div className="space-y-4">
+          {/* Hold Progress Bars */}
+          <div className="mt-4 w-full space-y-2">
+            <div>
+              <b>Letter Hold Progress:</b>
+              <div className="h-4 bg-white/30 rounded overflow-hidden">
+                <div
+                  className="h-4 bg-green-500 rounded"
+                  style={{ width: `${letterProgress}%` }}
+                />
+              </div>
             </div>
 
-            {lastRecorded && (
-              <div className="text-green-600 mt-1">
-                Recorded sample for: <strong>{lastRecorded}</strong>
+            <div>
+              <b>Next Hold Progress:</b>
+              <div className="h-4 bg-white/30 rounded overflow-hidden">
+                <div
+                  className="h-4 bg-blue-500 rounded"
+                  style={{ width: `${nextProgress}%` }}
+                />
               </div>
-            )}
-
-            <button
-              onClick={downloadJSON}
-              className="px-4 py-1 border rounded bg-blue-600 text-white hover:bg-blue-700"
-            >
-              Download JSON
-            </button>
+            </div>
           </div>
-        )}
+        </div>
+
+        {/* ================= TEXT ================= */}
+        <div className="space-y-3">
+          <div className="rounded-xl p-3 bg-white/5 ring-1 ring-white/10">
+            <p className="text-xs opacity-60">Sentence</p>
+            <p className="text-lg font-semibold break-words">
+              {committedSentence || '—'}
+            </p>
+          </div>
+
+          <div className="rounded-xl p-3 bg-white/5 ring-1 ring-white/10">
+            <p className="text-xs opacity-60">Pending Word</p>
+            <p className="font-mono text-2xl tracking-widest">
+              {pendingWord || '—'}
+            </p>
+          </div>
+        </div>
+
+        {/* ================= CONTROLS ================= */}
+        <div className="grid grid-cols-2 gap-3 pt-2">
+
+          {/* BACKSPACE */}
+          <button
+            onClick={() => {
+              if (!pendingWordRef.current) return
+              pendingWordRef.current =
+                pendingWordRef.current.slice(0, -1)
+              setPendingWord(pendingWordRef.current)
+              lockedLetterRef.current = ''
+            }}
+            className="rounded-xl bg-gradient-to-br from-yellow-400 to-orange-500 hover:scale-[1.02] transition font-bold text-black py-2"
+          >
+            ⌫ Backspace
+          </button>
+
+          {/* FLIP */}
+          <button
+            onClick={() => setFlipped((f) => !f)}
+            className="rounded-xl bg-white/10 hover:bg-white/20 transition py-2"
+          >
+            Flip
+          </button>
+
+          {/* DEBUG */}
+          <button
+            onClick={() => setDebugEnabled((d) => !d)}
+            className="rounded-xl bg-white/10 hover:bg-white/20 transition py-2"
+          >
+            {debugEnabled ? 'Hide Debug' : 'Show Debug'}
+          </button>
+
+          {/* COMMIT */}
+          <button
+            onClick={() => {
+              if (!pendingWordRef.current.trim()) return
+              setCommittedSentence((s) =>
+                s ? `${s} ${pendingWordRef.current}` : pendingWordRef.current
+              )
+              pendingWordRef.current = ''
+              setPendingWord('')
+              lockedLetterRef.current = ''
+            }}
+            className="rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 hover:scale-[1.02] transition font-bold py-2"
+          >
+            Commit Word
+          </button>
+
+          {/* CLEAR */}
+          <button
+            onClick={() => {
+              setCommittedSentence('')
+              pendingWordRef.current = ''
+              setPendingWord('')
+              setCurrentLetter('—')
+              lockedLetterRef.current = ''
+            }}
+            className="col-span-2 rounded-xl bg-gradient-to-br from-red-500 to-rose-600 hover:scale-[1.02] transition font-bold py-2"
+          >
+            Clear All
+          </button>
+        </div>
       </div>
+
+      <video ref={videoRef} hidden />
     </div>
-  );
+  </div>
+)
 }
