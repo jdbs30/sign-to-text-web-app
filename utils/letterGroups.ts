@@ -1,5 +1,4 @@
-// utils/letterGroups.ts
-export const LETTER_GROUPS = {
+export const LETTER_GROUPS: Record<string, string[]> = {
   G1: ['y', 'j'],
   G2: ['c', 'o'],
   G3: ['g', 'h'],
@@ -7,17 +6,13 @@ export const LETTER_GROUPS = {
   G5: ['p','q','z'],
   G6: ['a','e','m','n','s','t'],
   G7: ['l'],
-  G8: ['x'],
-} as const;
+  G8: ['x']
+};
 
-export type GroupId = keyof typeof LETTER_GROUPS;
-
-export function getGroupByLetter(letter: string): GroupId | null {
-  letter = letter.toLowerCase();
+export function getLetterGroup(letter: string): string {
+  const l = letter.toLowerCase();
   for (const g in LETTER_GROUPS) {
-    if (LETTER_GROUPS[g as GroupId].includes(letter)) {
-      return g as GroupId;
-    }
+    if (LETTER_GROUPS[g].includes(l)) return g;
   }
-  return null;
+  throw new Error(`Unknown letter group for ${letter}`);
 }
